@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 
 # python std lib
+import json
+import logging
 import random
+import socket
 
 # rediscluster imports
 from .crc import crc16
@@ -9,9 +12,10 @@ from .exceptions import RedisClusterException, RedisClusterConfigError
 
 # 3rd party imports
 from redis import Redis
-from redis._compat import unicode, long, basestring
 from redis.connection import Encoder
 from redis import ConnectionError, TimeoutError, ResponseError
+
+log = logging.getLogger(__name__)
 
 
 class NodeManager(object):
@@ -30,6 +34,8 @@ class NodeManager(object):
             it was operating on. This will allow the client to drift along side the cluster
             if the cluster nodes move around alot.
         """
+        log.debug("Creating new NodeManager instance")
+
         self.connection_kwargs = connection_kwargs
         self.nodes = {}
         self.slots = {}
@@ -65,12 +71,30 @@ class NodeManager(object):
             if not isinstance(item, dict):
                 raise RedisClusterConfigError("items inside host_port_remap list must be of dict type")
 
+            if len(set(item.keys()) - {'from_host', 'from_port', 'to_host', 'to_port'}) != 0:
+                raise RedisClusterConfigError("Invalid keys provided in host_port_remap rule")
+
             # If we have from_host, we must have a to_host option to allow for translation to work
             if ('from_host' in item and 'to_host' not in item) or ('from_host' not in item and 'to_host' in item):
-                raise RedisClusterConfigError("Both from_host and to_host must be present in remap item if either is defined")
+                raise RedisClusterConfigError("Both from_host and to_host must be present in host_port_remap rule if either is defined")
 
-            if ('from_port' in item and 'to_port' not in item) or  ('from_port' not in item and 'to_port' in item):
-                raise RedisClusterConfigError("Both from_port and to_port must be present in remap item")
+            if ('from_port' in item and 'to_port' not in item) or ('from_port' not in item and 'to_port' in item):
+                raise RedisClusterConfigError("Both from_port and to_port must be present in host_port_remap rule if either is defined")
+
+            try:
+                socket.inet_aton(item.get('from_host', '0.0.0.0').strip())
+                socket.inet_aton(item.get('to_host', '0.0.0.0').strip())
+            except socket.error:
+                raise RedisClusterConfigError("Both from_host and to_host in host_port_remap rule must be a valid ip address")
+            if len(item.get('from_host', '0.0.0.0').split('.')) < 4 or len(item.get('to_host', '0.0.0.0').split('.')) < 4 :
+                raise RedisClusterConfigError(
+                    "Both from_host and to_host in host_port_remap rule must must have all octets specified")
+
+            try:
+                int(item.get('from_port', 0))
+                int(item.get('to_port', 0))
+            except ValueError:
+                raise RedisClusterConfigError("Both from_port and to_port in host_port_remap rule must be integers")
 
     def keyslot(self, key):
         """
@@ -162,13 +186,27 @@ class NodeManager(object):
             'port',
             'decode_responses',
         )
-        connection_kwargs = {k: v for k, v in self.connection_kwargs.items() if k in set(allowed_keys) - set(disabled_keys)}
-        return Redis(host=host, port=port, decode_responses=decode_responses, **connection_kwargs)
+        connection_kwargs = {
+            k: v
+            for k, v in self.connection_kwargs.items()
+            if k in set(allowed_keys) - set(disabled_keys)
+        }
+
+        return Redis(
+            host=host,
+            port=port,
+            decode_responses=decode_responses,
+            **connection_kwargs
+        )
 
     def initialize(self):
         """
         Init the slots cache by asking all startup nodes what the current cluster configuration is
         """
+        log.debug("Running initialize on NodeManager")
+        log.debug("Original startup nodes configuration")
+        log.debug(json.dumps(self.orig_startup_nodes, indent=2))
+
         nodes_cache = {}
         tmp_slots = {}
 
@@ -208,7 +246,6 @@ class NodeManager(object):
 
             # No need to decode response because Redis should handle that for us...
             for slot in cluster_slots:
-                # import pdb; pdb.set_trace()
                 master_node = slot[2]
 
                 if master_node[0] == '':
@@ -269,28 +306,48 @@ class NodeManager(object):
         self.nodes = nodes_cache
         self.reinitialize_counter = 0
 
+        log.debug("NodeManager initialize done : Nodes")
+        log.debug(json.dumps(self.nodes, indent=2))
+
     def remap_internal_node_object(self, node_obj):
         if not self.host_port_remap:
             # No remapping rule set, return object unmodified
             return node_obj
 
         for remap_rule in self.host_port_remap:
-            if 'from_host' in remap_rule and 'to_host' in remap_rule:
-                if remap_rule['from_host'] in node_obj[0]:
-                    # print('remapping host', node_obj[0], remap_rule['to_host'])
+            if self._remap_rule_applies(remap_rule, node_obj):
+                # We have found a valid match and can proceed with the remapping
+                if 'to_host' in remap_rule:
                     node_obj[0] = remap_rule['to_host']
-
-            ## The port value is always an integer
-            if 'from_port' in remap_rule and 'to_port' in remap_rule:
-                if remap_rule['from_port'] == node_obj[1]:
-                    # print('remapping port', node_obj[1], remap_rule['to_port'])
+                if 'to_port' in remap_rule:
                     node_obj[1] = remap_rule['to_port']
+                # At this point remapping has occurred, so no further rules should be processed
+                break
 
         return node_obj
 
-    def increment_reinitialize_counter(self, ct=1):
+    def _remap_rule_applies(self, remap_rule, node_obj):
+        # Double check to make sure that the relevant host and/or port fields are present
+        if not (('from_host' in remap_rule and 'to_host' in remap_rule) or ('from_port' in remap_rule and 'to_port' in remap_rule)):
+            return False
+        if 'from_host' in remap_rule and not self._ips_equal(remap_rule['from_host'], node_obj[0]):
+            return False
+        if 'from_port' in remap_rule and remap_rule['from_port'] != node_obj[1]:
+            return False
+        # If the previous conditions are not met then this is a valid match.
+        return True
+
+    def _ips_equal(self, ip1, ip2):
+        split_ip1 = ip1.strip().split(".")
+        split_ip2 = ip2.strip().split(".")
+        for i, octet in enumerate(split_ip1):
+            if int(octet) != int(split_ip2[i]):
+                return False
+        return True
+
+    def increment_reinitialize_counter(self, ct=1, count=1):
         for i in range(min(ct, self.reinitialize_steps)):
-            self.reinitialize_counter += 1
+            self.reinitialize_counter += count
             if self.reinitialize_counter % self.reinitialize_steps == 0:
                 self.initialize()
 
@@ -304,7 +361,11 @@ class NodeManager(object):
 
         def node_require_full_coverage(node):
             try:
-                r_node = self.get_redis_link(host=node["host"], port=node["port"], decode_responses=True)
+                r_node = self.get_redis_link(
+                    host=node["host"],
+                    port=node["port"],
+                    decode_responses=True,
+                )
                 return "yes" in r_node.config_get("cluster-require-full-coverage").values()
             except ConnectionError:
                 return False

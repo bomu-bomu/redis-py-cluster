@@ -3,6 +3,8 @@ from __future__ import unicode_literals
 
 # python std lib
 import datetime
+import json
+import logging
 import random
 import string
 import time
@@ -21,6 +23,7 @@ from .exceptions import (
     ClusterError,
     MovedError,
     RedisClusterException,
+    SlotNotCoveredError,
     TryAgainError,
 )
 from .pubsub import ClusterPubSub
@@ -51,6 +54,9 @@ from redis.exceptions import (
     ResponseError,
     TimeoutError,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 class CaseInsensitiveDict(dict):
@@ -93,14 +99,15 @@ class RedisCluster(Redis):
             'ACL DELUSER',
             'ACL GENPASS',
             'ACL GETUSER',
+            'ACL HELP',
             'ACL LIST',
             'ACL LOAD',
+            'ACL LOG',
             'ACL SAVE',
             'ACL SETUSER',
             'ACL USERS',
             'ACL WHOAMI',
             'BITOP',
-            'CLIENT SETNAME',
             'MOVE',
             'SCRIPT KILL',
             'SENTINEL GET-MASTER-ADDR-BY-NAME',
@@ -113,6 +120,7 @@ class RedisCluster(Redis):
             'SENTINEL SLAVES',
             'SHUTDOWN',
             'SLAVEOF',
+            'WAIT',
         ], 'blocked'),
         string_keys_to_dict([
             "BGREWRITEAOF",
@@ -121,6 +129,7 @@ class RedisCluster(Redis):
             "CLIENT ID",
             "CLIENT KILL",
             "CLIENT LIST",
+            "CLIENT SETNAME",
             "CLUSTER INFO",
             "CONFIG GET",
             "CONFIG RESETSTAT",
@@ -148,6 +157,7 @@ class RedisCluster(Redis):
             "SCRIPT EXISTS",
             "SCRIPT FLUSH",
             "SCRIPT LOAD",
+            "SCRIPT DEBUG",
         ], 'all-masters'),
         string_keys_to_dict([
             "CLUSTER NODES",
@@ -212,6 +222,7 @@ class RedisCluster(Redis):
             "CLIENT ID",
             "CLIENT KILL",
             "CLIENT LIST",
+            "CLIENT SETNAME",
             "CLUSTER INFO",
             "CONFIG GET",
             "CONFIG RESETSTAT",
@@ -318,13 +329,19 @@ class RedisCluster(Redis):
             - db (Redis do not support database SELECT in cluster mode)
         """
         # Tweaks to Redis client arguments when running in cluster mode
+        log.info("Created new instance of RedisCluster client instance")
+        log.debug("startup_nodes : " + json.dumps(startup_nodes, indent=2))
+
         if "db" in kwargs:
             raise RedisClusterException("Argument 'db' is not possible to use in cluster mode")
 
-        if kwargs.pop('ssl', False):  # Needs to be removed to avoid exception in redis Connection init
+        # Needs to be removed to avoid exception in redis Connection init
+        if kwargs.pop('ssl', False):
+            log.info("Patching connection_class to SSLClusterConnection")
             connection_class = SSLClusterConnection
 
         if "connection_pool" in kwargs:
+            log.info("Using custom created connection pool")
             pool = kwargs.pop('connection_pool')
         else:
             startup_nodes = [] if startup_nodes is None else startup_nodes
@@ -335,10 +352,20 @@ class RedisCluster(Redis):
 
             if readonly_mode:
                 connection_pool_cls = ClusterReadOnlyConnectionPool
+                log.info("Using ClusterReadOnlyConnectionPool")
             elif read_from_replicas:
                 connection_pool_cls = ClusterWithReadReplicasConnectionPool
+                log.info("Using ClusterWithReadReplicasConnectionPool")
             else:
                 connection_pool_cls = ClusterConnectionPool
+                log.info("Using ClusterConnectionPool")
+
+            log.debug("Connection pool class " + str(connection_pool_cls))
+
+            # If connection pool fails to initialize, parent class (Redis) __del__
+            # will try to access self.connection before it's defined
+            # throwing an AttributeError.
+            self.connection = None
 
             pool = connection_pool_cls(
                 startup_nodes=startup_nodes,
@@ -395,7 +422,7 @@ class RedisCluster(Redis):
             connection_pool_cls = ClusterConnectionPool
 
         connection_pool = connection_pool_cls.from_url(url, db=db, skip_full_coverage_check=skip_full_coverage_check, **kwargs)
-        
+
         if connection_pool.connection_class == SSLConnection:
             connection_pool.connection_class = SSLClusterConnection
 
@@ -521,7 +548,7 @@ class RedisCluster(Redis):
 
         It will try the number of times specified by the config option "self.cluster_down_retry_attempts"
         which defaults to 3 unless manually configured.
-        
+
         If it reaches the number of times, the command will raises ClusterDownException.
         """
         for _ in range(0, self.cluster_down_retry_attempts):
@@ -543,6 +570,7 @@ class RedisCluster(Redis):
             raise RedisClusterException("Unable to determine command to use")
 
         command = args[0]
+        log.debug("Command to execute : " + str(command) + " : " + str(args) + " : " + str(kwargs))
 
         # If set externally we must update it before calling any commands
         if self.refresh_table_asap:
@@ -560,51 +588,96 @@ class RedisCluster(Redis):
         try_random_node = False
         slot = self._determine_slot(*args)
         ttl = int(self.RedisClusterRequestTTL)
+        connection_error_retry_counter = 0
 
         while ttl > 0:
             ttl -= 1
-
-            if asking:
-                node = self.connection_pool.nodes.nodes[redirect_addr]
-                r = self.connection_pool.get_connection_by_node(node)
-            elif try_random_node:
-                r = self.connection_pool.get_random_connection()
-                try_random_node = False
-            else:
-                if self.refresh_table_asap:
-                    # MOVED
-                    node = self.connection_pool.get_master_node_by_slot(slot)
-                    # Reset the flag when it has been consumed to avoid it being
-                    self.refresh_table_asap = False
-                else:
-                    node = self.connection_pool.get_node_by_slot(slot, self.read_from_replicas and (command in self.READ_COMMANDS))
-                    is_read_replica = node['server_type'] == 'slave'
-                r = self.connection_pool.get_connection_by_node(node)
+            connection = None
 
             try:
                 if asking:
-                    r.send_command('ASKING')
-                    self.parse_response(r, "ASKING", **kwargs)
+                    node = self.connection_pool.nodes.nodes[redirect_addr]
+                    connection = self.connection_pool.get_connection_by_node(node)
+                elif try_random_node:
+                    connection = self.connection_pool.get_random_connection()
+                    try_random_node = False
+                else:
+                    if self.refresh_table_asap:
+                        # MOVED
+                        node = self.connection_pool.get_master_node_by_slot(slot)
+                        self.refresh_table_asap = False
+                    else:
+                        node = self.connection_pool.get_node_by_slot(
+                            slot,
+                            self.read_from_replicas and (command in self.READ_COMMANDS)
+                        )
+                        is_read_replica = node['server_type'] == 'slave'
+
+                    connection = self.connection_pool.get_connection_by_node(node)
+
+                log.debug("Determined node to execute : " + str(node))
+
+                if asking:
+                    connection.send_command('ASKING')
+                    self.parse_response(connection, "ASKING", **kwargs)
                     asking = False
                 if is_read_replica:
                     # Ask read replica to accept reads (see https://redis.io/commands/readonly)
                     # TODO: do we need to handle errors from this response?
-                    r.send_command('READONLY')
-                    self.parse_response(r, 'READONLY', **kwargs)
+                    connection.send_command('READONLY')
+                    self.parse_response(connection, 'READONLY', **kwargs)
                     is_read_replica = False
 
-                r.send_command(*args)
-                return self.parse_response(r, command, **kwargs)
-            except (RedisClusterException, BusyLoadingError):
+                connection.send_command(*args)
+                return self.parse_response(connection, command, **kwargs)
+            except SlotNotCoveredError as e:
+                log.exception("SlotNotCoveredError")
+
+                # In some cases during failover to a replica is happening
+                # a slot sometimes is not covered by the cluster layout and
+                # we need to attempt to refresh the cluster layout and try again
+                self.refresh_table_asap = True
+                time.sleep(0.1)
+
+                # This is the last attempt before we run out of TTL, raise the exception
+                if ttl == 1:
+                    raise e
+            except (RedisClusterException, BusyLoadingError) as e:
+                log.exception("RedisClusterException || BusyLoadingError")
                 raise
-            except ConnectionError:
-                r.disconnect()
-            except TimeoutError:
+            except ConnectionError as e:
+                log.exception("ConnectionError")
+
+                connection.disconnect()
+                connection_error_retry_counter += 1
+
+                # Give the node 0.1 seconds to get back up and retry again with same
+                # node and configuration. After 5 attempts then try to reinitialize
+                # the cluster and see if the nodes configuration has changed or not
+                if connection_error_retry_counter < 5:
+                    time.sleep(0.25)
+                else:
+                    # Reset the counter back to 0 as it should have 5 new attempts
+                    # after the client tries to reinitailize the cluster setup to the
+                    # new configuration.
+                    connection_error_retry_counter = 0
+                    self.refresh_table_asap = True
+
+                    # Hard force of reinitialize of the node/slots setup
+                    self.connection_pool.nodes.increment_reinitialize_counter(
+                        count=self.connection_pool.nodes.reinitialize_steps,
+                    )
+
+            except TimeoutError as e:
+                log.exception("TimeoutError")
+
                 if ttl < self.RedisClusterRequestTTL / 2:
                     time.sleep(0.05)
                 else:
                     try_random_node = True
             except ClusterDownError as e:
+                log.exception("ClusterDownError")
+
                 self.connection_pool.disconnect()
                 self.connection_pool.reset()
                 self.refresh_table_asap = True
@@ -615,18 +688,27 @@ class RedisCluster(Redis):
                 # This counter will increase faster when the same client object
                 # is shared between multiple threads. To reduce the frequency you
                 # can set the variable 'reinitialize_steps' in the constructor.
+                log.exception("MovedError")
+
                 self.refresh_table_asap = True
                 self.connection_pool.nodes.increment_reinitialize_counter()
 
                 node = self.connection_pool.nodes.set_node(e.host, e.port, server_type='master')
                 self.connection_pool.nodes.slots[e.slot_id][0] = node
             except TryAgainError as e:
+                log.exception("TryAgainError")
+
                 if ttl < self.RedisClusterRequestTTL / 2:
                     time.sleep(0.05)
             except AskError as e:
+                log.exception("AskError")
+
                 redirect_addr, asking = "{0}:{1}".format(e.host, e.port), True
             finally:
-                self.connection_pool.release(r)
+                if connection is not None:
+                    self.connection_pool.release(connection)
+
+            log.debug("TTL loop : " + str(ttl))
 
         raise ClusterError('TTL exhausted.')
 

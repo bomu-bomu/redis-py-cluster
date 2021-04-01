@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # python std lib
+import logging
 import sys
 
 # rediscluster imports
@@ -22,6 +23,7 @@ from rediscluster.exceptions import (
     MovedError,
     MasterDownError,
 )
+from rediscluster.pipeline import ClusterPipeline
 
 
 def int_or_str(value):
@@ -44,6 +46,7 @@ __all__ = [
     ClusterDownError,
     ClusterDownException,
     ClusterError,
+    ClusterPipeline,
     MasterDownError,
     MovedError,
     RedisCluster,
@@ -51,3 +54,6 @@ __all__ = [
     RedisClusterException,
     TryAgainError,
 ]
+
+# Set default logging handler to avoid "No handler found" warnings.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
